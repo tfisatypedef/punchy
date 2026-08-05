@@ -1,0 +1,6 @@
+{
+  "name": "Punch - Kick Live Streaming Client",
+  "description": "A high-performance Kick live streaming web platform featuring live stream discovery, real-time simulated chat, category browsing, and streamer channels.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
