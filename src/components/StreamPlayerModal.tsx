@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import Hls from 'hls.js';
 import {
   X,
   Eye,
@@ -12,16 +13,29 @@ import {
   Radio,
   Send,
   CheckCircle2,
-  Settings,
   MessageSquare,
-  Sparkles,
   Users,
   RotateCcw,
   RotateCw,
-  SkipForward
+  SkipForward,
+  Loader2,
+  AlertTriangle,
+  Volume1,
 } from 'lucide-react';
 import { KickStream, ChatMessage } from '../types';
 import { MOCK_CHAT_MESSAGES, SAMPLE_CHAT_POOL } from '../data/mockData';
+
+type DvrOption = '10m' | '30m' | '1h' | '3h' | '6h';
+type MediaMode = 'hls' | 'native' | 'none';
+
+const DVR_WINDOW_SECONDS: Record<DvrOption, number> = {
+  '10m': 600,
+  '30m': 1800,
+  '1h': 3600,
+  '3h': 10800,
+  '6h': 21600,
+};
+const LIVE_EDGE_TOLERANCE_SEC = 10;
 
 interface StreamPlayerModalProps {
   stream: KickStream | null;
@@ -40,93 +54,279 @@ export const StreamPlayerModal: React.FC<StreamPlayerModalProps> = ({
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const seekBarRef = useRef<HTMLDivElement | null>(null);
+  const isSeekingRef = useRef(false);
+  const hlsRef = useRef<Hls | null>(null);
+  const hideControlsTimerRef = useRef<number | null>(null);
+  const togglePlayRef = useRef<() => void>(() => {});
+  const seekRelativeRef = useRef<(n: number) => void>(() => {});
 
+  // ---- Media source resolution ----
+  // Mock cards ship `https://player.kick.com/<slug>` page URLs (not media). We
+  // auto-resolve those against the server's Kick proxy so the unified hls.js
+  // player always gets a real, seekable HLS playback URL.
+  const [resolvedStreamUrl, setResolvedStreamUrl] = useState<string | null>(null);
+  const [resolving, setResolving] = useState(false);
+
+  const mediaUrl = resolvedStreamUrl || stream.streamUrl || '';
+  const mediaMode: MediaMode = (() => {
+    if (!mediaUrl) return 'none';
+    if (/\.m3u8($|\?)/i.test(mediaUrl)) return 'hls';
+    if (/\.(mp4|webm|ogg|mov)($|\?)/i.test(mediaUrl)) return 'native';
+    return 'none';
+  })();
+
+  // Load through the server's HLS relay so the browser can read Kick's
+  // CORS-locked playback CDN. Playlists and segments are rewritten/streamed
+  // same-origin by the server, so hls.js seeking keeps working.
+  const hlsLoadUrl =
+    mediaMode === 'hls' || mediaMode === 'native'
+      ? `/api/v1/hls/proxy.m3u8?url=${encodeURIComponent(mediaUrl)}`
+      : mediaUrl;
+
+  useEffect(() => {
+    let cancelled = false;
+    const raw = stream.streamUrl || '';
+    const isDirectMedia = /\.(m3u8|mp4|webm|ogg|mov)($|\?)/i.test(raw);
+
+    setResolvedStreamUrl(null);
+    setResolving(!isDirectMedia);
+
+    if (isDirectMedia || !raw) {
+      setResolving(false);
+      return;
+    }
+
+    const slugMatch = raw.match(/kick\.com\/([^/?#]+)/i);
+    const slug = slugMatch ? slugMatch[1].toLowerCase() : stream.streamer.toLowerCase();
+    if (!slug) {
+      setResolving(false);
+      return;
+    }
+
+    fetch(`/api/v1/channels/${encodeURIComponent(slug)}`)
+      .then((r) => r.json())
+      .then((res) => {
+        if (cancelled) return;
+        const real = res?.data;
+        if (real?.isLive && real.streamUrl && /\.(m3u8|mp4|webm|ogg|mov)($|\?)/i.test(real.streamUrl)) {
+          setResolvedStreamUrl(real.streamUrl);
+        }
+        setResolving(false);
+      })
+      .catch(() => {
+        if (!cancelled) setResolving(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [stream.streamUrl, stream.streamer]);
+
+  // ---- Playback state ----
   const [isPlaying, setIsPlaying] = useState(true);
-  const [isMuted, setIsMuted] = useState(false);
+  const [isMuted, setIsMuted] = useState(true);
   const [volume, setVolume] = useState(80);
-  const [quality, setQuality] = useState('1080p60');
-  const [playerMode, setPlayerMode] = useState<'embed' | 'direct' | 'preview'>('embed');
-  const [customIngestUrl, setCustomIngestUrl] = useState('');
-  const [activeStreamUrl, setActiveStreamUrl] = useState(
-    stream.streamUrl || `https://player.kick.com/${stream.streamer.toLowerCase()}`
-  );
+  const [buffering, setBuffering] = useState(false);
+  const [mediaError, setMediaError] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [levels, setLevels] = useState<{ index: number; label: string }[]>([]);
+  const [qualityIndex, setQualityIndex] = useState(-1);
+  const [controlsVisible, setControlsVisible] = useState(true);
 
-  // Video Seek Bar & DVR State
-  const [currentTime, setCurrentTime] = useState(480); // Default 8 minutes into stream DVR buffer
-  const [duration, setDuration] = useState(3600); // 1 hour total stream buffer (3600s)
-  const [dvrWindowOption, setDvrWindowOption] = useState<'10m' | '30m' | '1h' | '3h' | '6h'>('1h');
+  // Auto-hide the controls overlay after a few seconds of inactivity (YouTube-style)
+  const showControlsTemporarily = useCallback(() => {
+    setControlsVisible(true);
+    if (hideControlsTimerRef.current) window.clearTimeout(hideControlsTimerRef.current);
+    hideControlsTimerRef.current = window.setTimeout(() => setControlsVisible(false), 3000);
+  }, []);
+
+  useEffect(() => {
+    showControlsTemporarily();
+    return () => {
+      if (hideControlsTimerRef.current) window.clearTimeout(hideControlsTimerRef.current);
+    };
+  }, [stream.id, showControlsTemporarily]);
+
+  // YouTube-style keyboard shortcuts (Space, ←/→, M, F) — ignored while typing in chat
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      const tag = t?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t?.isContentEditable) return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        togglePlayRef.current();
+        showControlsTemporarily();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        seekRelativeRef.current(-10);
+        showControlsTemporarily();
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        seekRelativeRef.current(10);
+        showControlsTemporarily();
+      } else if (e.key.toLowerCase() === 'm') {
+        setIsMuted((m) => !m);
+        showControlsTemporarily();
+      } else if (e.key.toLowerCase() === 'f') {
+        const el = document.documentElement;
+        if (!document.fullscreenElement) el.requestFullscreen?.();
+        else document.exitFullscreen?.();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- Seek bar state (single source of truth = the <video> element) ----
+  const [currentTime, setCurrentTime] = useState(0);
+  const [seekRange, setSeekRange] = useState({ start: 0, end: 0 });
+  const [bufferedEnd, setBufferedEnd] = useState(0);
+  const [isLive, setIsLive] = useState(stream.isLive ?? false);
+  const [dvrWindowOption, setDvrWindowOption] = useState<DvrOption>('1h');
   const [isSeeking, setIsSeeking] = useState(false);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [hoverX, setHoverX] = useState<number | null>(null);
 
   const [viewerCount, setViewerCount] = useState(stream.viewers);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(
-    MOCK_CHAT_MESSAGES[stream.id] || MOCK_CHAT_MESSAGES[stream.streamer.toLowerCase()] || MOCK_CHAT_MESSAGES['1']
+    MOCK_CHAT_MESSAGES[stream.id] ||
+      MOCK_CHAT_MESSAGES[stream.streamer.toLowerCase()] ||
+      MOCK_CHAT_MESSAGES['1']
   );
   const [inputMessage, setInputMessage] = useState('');
   const chatBottomRef = useRef<HTMLDivElement>(null);
 
-  // Helper to format seconds to MM:SS or HH:MM:SS
-  const formatTime = (seconds: number): string => {
-    if (isNaN(seconds) || seconds < 0) return '00:00';
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    if (h > 0) {
-      return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
-    }
-    return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
-  };
+  // ---- Sync UI state from the live video element ----
+  const syncState = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    setCurrentTime(v.currentTime);
+    setIsPlaying(!v.paused);
 
-  // Seek bar handlers
-  const handleSeekChange = (newTime: number) => {
-    const clamped = Math.max(0, Math.min(duration, newTime));
-    setCurrentTime(clamped);
-
-    if (videoRef.current) {
-      const realDur = videoRef.current.duration;
-      if (realDur && !isNaN(realDur) && realDur > 0) {
-        // Wrap seek time seamlessly if seeking beyond actual media duration
-        const targetMediaTime = clamped % realDur;
-        videoRef.current.currentTime = targetMediaTime;
+    const sb = v.seekable;
+    let start = 0;
+    let end = 0;
+    if (sb.length > 0) {
+      const s = sb.start(sb.length - 1);
+      const e = sb.end(sb.length - 1);
+      if (Number.isFinite(s) && Number.isFinite(e) && e >= s) {
+        start = s;
+        end = e;
       }
     }
-  };
-
-  const handleSeekRelative = (offsetSeconds: number) => {
-    handleSeekChange(currentTime + offsetSeconds);
-  };
-
-  const handleJumpToLive = () => {
-    handleSeekChange(duration);
-  };
-
-  const handleDvrWindowChange = (opt: '10m' | '30m' | '1h' | '3h' | '6h') => {
-    setDvrWindowOption(opt);
-    let newDur = 3600;
-    if (opt === '10m') newDur = 600;
-    if (opt === '30m') newDur = 1800;
-    if (opt === '1h') newDur = 3600;
-    if (opt === '3h') newDur = 10800;
-    if (opt === '6h') newDur = 21600;
-    setDuration(newDur);
-    if (currentTime > newDur) {
-      setCurrentTime(newDur);
+    if (end === 0 && Number.isFinite(v.duration) && v.duration > 0) {
+      end = v.duration;
     }
-  };
+    setSeekRange({ start, end });
 
-  const togglePlay = () => {
-    if (videoRef.current) {
-      if (isPlaying) {
-        videoRef.current.pause();
-      } else {
-        videoRef.current.play().catch(() => {});
-      }
+    // Buffered range (YouTube-style white buffer on the seek bar)
+    let bufEnd = end;
+    const bf = v.buffered;
+    if (bf.length > 0) {
+      const b = bf.end(bf.length - 1);
+      if (Number.isFinite(b) && b > 0) bufEnd = b;
     }
-    setIsPlaying(!isPlaying);
-  };
+    setBufferedEnd(bufEnd);
 
-  // Sync volume and mute to video element
+    // duration === Infinity is the hls.js/native marker for a live stream
+    if (v.duration === Infinity) setIsLive(true);
+    else if (Number.isFinite(v.duration)) setIsLive(false);
+  }, []);
+
+  // ---- hls.js / native media setup ----
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (mediaMode !== 'hls' && mediaMode !== 'native') return;
+
+    setMediaError(false);
+    setBuffering(true);
+    setLevels([]);
+    setQualityIndex(-1);
+
+    if (mediaMode === 'hls' && Hls.isSupported()) {
+      const hls = new Hls({
+        liveDurationInfinity: true,
+        liveSyncDurationCount: 3,
+        backBufferLength: 120,
+        maxBufferLength: 30,
+        enableWorker: true,
+        capLevelToPlayerSize: true,
+        lowLatencyMode: false,
+      });
+      hlsRef.current = hls;
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
+        const lv = data.levels.map((l, i) => ({
+          index: i,
+          label: l.height ? `${l.height}p` : l.name ? String(l.name) : `${Math.round((l.bitrate || 0) / 1000)}k`,
+        }));
+        setLevels(lv);
+        setBuffering(false);
+        video.play().catch(() => {});
+      });
+
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (data.fatal) {
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls.startLoad();
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            setMediaError(true);
+          }
+        }
+      });
+
+      hls.loadSource(hlsLoadUrl);
+      hls.attachMedia(video);
+
+      return () => {
+        hls.destroy();
+        hlsRef.current = null;
+      };
+    } else if (mediaMode === 'hls' && video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari / native HLS
+      video.src = hlsLoadUrl;
+      const onCanPlay = () => {
+        setBuffering(false);
+        video.play().catch(() => {});
+      };
+      video.addEventListener('canplay', onCanPlay);
+      return () => {
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeAttribute('src');
+        video.load();
+      };
+    } else if (mediaMode === 'native') {
+      video.src = hlsLoadUrl;
+      const onCanPlay = () => {
+        setBuffering(false);
+        video.play().catch(() => {});
+      };
+      video.addEventListener('canplay', onCanPlay);
+      return () => {
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeAttribute('src');
+        video.load();
+      };
+    } else {
+      setMediaError(true);
+      setBuffering(false);
+    }
+  }, [mediaUrl, mediaMode, reloadKey]);
+
+  // Reset the playhead / range when the stream changes
+  useEffect(() => {
+    setCurrentTime(0);
+    setSeekRange({ start: 0, end: 0 });
+    setIsLive(stream.isLive ?? false);
+  }, [stream.id]);
+
+  // Sync volume/mute to the element
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.volume = isMuted ? 0 : volume / 100;
@@ -134,31 +334,7 @@ export const StreamPlayerModal: React.FC<StreamPlayerModalProps> = ({
     }
   }, [volume, isMuted]);
 
-  // Sync active stream URL when stream prop changes
-  useEffect(() => {
-    setActiveStreamUrl(
-      stream.streamUrl || `https://player.kick.com/${stream.streamer.toLowerCase()}`
-    );
-  }, [stream]);
-
-  // Simulated timer for preview & embed mode seek bar progression
-  useEffect(() => {
-    if (playerMode === 'direct') return;
-    if (!isPlaying) return;
-
-    const interval = setInterval(() => {
-      if (!isSeeking) {
-        setCurrentTime((prev) => {
-          if (prev >= duration) return duration;
-          return prev + 1;
-        });
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [isPlaying, duration, isSeeking, playerMode]);
-
-  // Simulate viewer fluctuation and incoming chat messages
+  // Simulated viewer fluctuation and incoming chat messages
   useEffect(() => {
     const viewerInterval = setInterval(() => {
       const delta = Math.floor(Math.random() * 41) - 20;
@@ -188,6 +364,84 @@ export const StreamPlayerModal: React.FC<StreamPlayerModalProps> = ({
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
+  // ---- Derived seek bar values ----
+  const dvrSeconds = DVR_WINDOW_SECONDS[dvrWindowOption];
+  let displayStart = 0;
+  const displayEnd = seekRange.end;
+  if (isLive && seekRange.end > 0) {
+    displayStart = Math.max(seekRange.start, seekRange.end - dvrSeconds);
+  }
+  const windowLen = displayEnd - displayStart;
+  const clampedTime = Math.min(displayEnd, Math.max(displayStart, currentTime));
+  const progressPct = windowLen > 0 ? ((clampedTime - displayStart) / windowLen) * 100 : 0;
+  const bufferedPct =
+    windowLen > 0 ? Math.max(0, Math.min(100, ((bufferedEnd - displayStart) / windowLen) * 100)) : 0;
+  const secondsFromLive = isLive && seekRange.end > 0 ? seekRange.end - currentTime : 0;
+  const atLiveEdge = isLive && secondsFromLive <= LIVE_EDGE_TOLERANCE_SEC;
+
+  // ---- Actions ----
+  const seekTo = (t: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    let target = t;
+    if (isLive) {
+      target = Math.min(seekRange.end - 0.5, Math.max(displayStart, t));
+    } else {
+      const dur = seekRange.end || v.duration || 0;
+      target = Math.max(0, Math.min(dur > 0 ? dur - 0.1 : t, t));
+    }
+    setCurrentTime(target);
+    try {
+      v.currentTime = target;
+    } catch {
+      /* ignore out-of-range seek */
+    }
+  };
+
+  const seekRelative = (offsetSeconds: number) => seekTo(currentTime + offsetSeconds);
+  seekRelativeRef.current = seekRelative;
+
+  const jumpToLive = () => {
+    const v = videoRef.current;
+    const hls = hlsRef.current;
+    if (!v) return;
+    let target: number;
+    if (hls && hls.liveSyncPosition && Number.isFinite(hls.liveSyncPosition)) {
+      target = hls.liveSyncPosition;
+    } else if (seekRange.end > 0) {
+      target = seekRange.end - 0.5;
+    } else {
+      return;
+    }
+    setCurrentTime(target);
+    try {
+      v.currentTime = target;
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const togglePlay = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) {
+      v.play().catch(() => {});
+      setIsPlaying(true);
+    } else {
+      v.pause();
+      setIsPlaying(false);
+    }
+  };
+  togglePlayRef.current = togglePlay;
+
+  const handleQualityChange = (idx: number) => {
+    setQualityIndex(idx);
+    const hls = hlsRef.current;
+    if (hls) {
+      hls.currentLevel = idx;
+    }
+  };
+
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputMessage.trim()) return;
@@ -205,9 +459,19 @@ export const StreamPlayerModal: React.FC<StreamPlayerModalProps> = ({
     setInputMessage('');
   };
 
-  const formatViewers = (count: number) => {
-    return count >= 1000 ? `${(count / 1000).toFixed(1)}k` : count.toLocaleString();
+  const formatViewers = (count: number) =>
+    count >= 1000 ? `${(count / 1000).toFixed(1)}k` : count.toLocaleString();
+
+  const formatTime = (seconds: number): string => {
+    if (!Number.isFinite(seconds) || seconds < 0) return '00:00';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+    return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
   };
+
+  const isHlsMode = mediaMode === 'hls' || mediaMode === 'native';
 
   return (
     <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex flex-col md:flex-row overflow-hidden animate-in fade-in duration-200">
@@ -224,397 +488,438 @@ export const StreamPlayerModal: React.FC<StreamPlayerModalProps> = ({
 
       {/* Main Stream Content Area */}
       <div className="flex-1 flex flex-col overflow-y-auto bg-[#0b0e14] p-3 md:p-6 space-y-4">
-        {/* Player Mode Switcher & Custom Ingest Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#161c2a] p-3 rounded-xl border border-[#232b3e]">
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
-            <button
-              onClick={() => setPlayerMode('embed')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shrink-0 ${
-                playerMode === 'embed'
-                  ? 'bg-[#53fc18] text-[#0b0e14] shadow-[0_0_12px_rgba(83,252,24,0.3)]'
-                  : 'text-[#94a3b8] hover:text-white hover:bg-[#1e2638]'
-              }`}
-            >
-              <Radio className="w-3.5 h-3.5" />
-              <span>Kick Live Player</span>
-            </button>
-
-            <button
-              onClick={() => setPlayerMode('direct')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shrink-0 ${
-                playerMode === 'direct'
-                  ? 'bg-[#53fc18] text-[#0b0e14] shadow-[0_0_12px_rgba(83,252,24,0.3)]'
-                  : 'text-[#94a3b8] hover:text-white hover:bg-[#1e2638]'
-              }`}
-            >
-              <Play className="w-3.5 h-3.5" />
-              <span>Direct Video Feed</span>
-            </button>
-
-            <button
-              onClick={() => setPlayerMode('preview')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shrink-0 ${
-                playerMode === 'preview'
-                  ? 'bg-[#53fc18] text-[#0b0e14] shadow-[0_0_12px_rgba(83,252,24,0.3)]'
-                  : 'text-[#94a3b8] hover:text-white hover:bg-[#1e2638]'
-              }`}
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>Preview Canvas</span>
-            </button>
-          </div>
-
-          {/* Quick Kick Ingest URL submit */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!customIngestUrl.trim()) return;
-              const clean = customIngestUrl
-                .trim()
-                .replace(/^https?:\/\//i, '')
-                .replace(/^kick\.com\//i, '')
-                .replace(/^player\.kick\.com\//i, '')
-                .split('/')[0]
-                .split('?')[0];
-
-              if (clean) {
-                setActiveStreamUrl(`https://player.kick.com/${clean}`);
-                setPlayerMode('embed');
-                setCustomIngestUrl('');
-              }
-            }}
-            className="flex items-center gap-2"
-          >
-            <input
-              type="text"
-              placeholder="Ingest Kick URL (e.g. kick.com/adrienbroner)"
-              value={customIngestUrl}
-              onChange={(e) => setCustomIngestUrl(e.target.value)}
-              className="bg-[#0b0e14] text-xs text-white placeholder-[#64748b] px-3 py-1.5 rounded-lg border border-[#232b3e] focus:outline-none focus:border-[#53fc18] w-48 sm:w-64"
-            />
-            <button
-              type="submit"
-              className="bg-[#53fc18] hover:bg-[#45d413] text-[#0b0e14] font-extrabold text-xs px-3 py-1.5 rounded-lg transition-colors cursor-pointer shrink-0"
-            >
-              Ingest
-            </button>
-          </form>
-        </div>
-
         {/* Video Player Container */}
         <div className="relative aspect-video w-full rounded-2xl overflow-hidden bg-black border border-[#1e2638] shadow-2xl group">
-          {playerMode === 'embed' ? (
-            /* Kick Live Official Embed Iframe */
-            <iframe
-              src={`https://player.kick.com/${stream.streamer.toLowerCase()}?autoplay=true&muted=${isMuted ? 'true' : 'false'}`}
-              className="w-full h-full border-0"
-              allow="autoplay; fullscreen; picture-in-picture; encrypted-media; accelerometer; gyroscope"
-              title={`${stream.streamer} Kick Live Player`}
-            />
-          ) : playerMode === 'direct' ? (
-            /* Direct HTML5 Video Stream */
-            <video
-              ref={videoRef}
-              src={
-                activeStreamUrl.endsWith('.m3u8') || activeStreamUrl.endsWith('.mp4')
-                  ? activeStreamUrl
-                  : 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'
-              }
-              autoPlay
-              muted={isMuted}
-              onTimeUpdate={() => {
-                if (videoRef.current && !isSeeking) {
-                  // Keep seek position synced to video time modulo current DVR window duration
-                  const mediaTime = videoRef.current.currentTime;
-                  const realDur = videoRef.current.duration;
-                  if (realDur && !isNaN(realDur) && realDur > 0) {
-                    // Normalize position within DVR window
-                    const normalizedTime = (currentTime - (currentTime % realDur)) + mediaTime;
-                    setCurrentTime(Math.min(duration, Math.max(0, normalizedTime)));
-                  } else {
-                    setCurrentTime(mediaTime);
-                  }
-                }
-              }}
-              onPlay={() => setIsPlaying(true)}
-              onPause={() => setIsPlaying(false)}
-              className="w-full h-full object-contain"
-            />
-          ) : (
-            /* Simulated Video Feed Image */
+          {mediaMode === 'none' ? (
+            /* No playback URL (real channel is offline or still resolving) — show static preview */
             <img
               src={stream.thumbnailUrl}
               alt={stream.title}
-              className={`w-full h-full object-cover transition-opacity duration-300 ${
-                isPlaying ? 'opacity-90' : 'opacity-40'
-              }`}
+              className="w-full h-full object-cover opacity-60"
+            />
+          ) : (
+            /* Single unified video element (hls.js / native HLS / mp4) */
+            <video
+              ref={videoRef}
+              className="w-full h-full object-contain bg-black"
+              poster={stream.thumbnailUrl}
+              autoPlay
+              playsInline
+              muted={isMuted}
+              onTimeUpdate={() => {
+                if (!isSeekingRef.current) syncState();
+              }}
+              onLoadedMetadata={syncState}
+              onDurationChange={syncState}
+              onSeeked={() => {
+                isSeekingRef.current = false;
+                setIsSeeking(false);
+                syncState();
+              }}
+              onProgress={syncState}
+              onPlay={() => {
+                setIsPlaying(true);
+                syncState();
+              }}
+              onPause={() => {
+                setIsPlaying(false);
+                syncState();
+              }}
+              onWaiting={() => setBuffering(true)}
+              onPlaying={() => {
+                setBuffering(false);
+                syncState();
+              }}
+              onError={() => setMediaError(true)}
             />
           )}
 
-          {/* Animated Stream Visualizer / Playing Overlay (for preview mode or overlay) */}
-          {playerMode === 'preview' && isPlaying && (
-            <div className="absolute top-4 right-4 flex items-center gap-1 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
-              <span className="w-1.5 h-4 bg-[#53fc18] animate-[bounce_1s_infinite_100ms]" />
-              <span className="w-1.5 h-6 bg-[#53fc18] animate-[bounce_1s_infinite_300ms]" />
-              <span className="w-1.5 h-3 bg-[#53fc18] animate-[bounce_1s_infinite_200ms]" />
-              <span className="text-xs font-bold text-white ml-1.5">LIVE 60 FPS</span>
+          {/* Resolving state (mock card URL being proxied to a real HLS URL) */}
+          {resolving && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60 p-6 text-center">
+              <Loader2 className="w-10 h-10 text-[#53fc18] animate-spin" />
+              <p className="text-sm font-bold text-white">Connecting to live stream…</p>
+              <p className="text-xs text-[#94a3b8] max-w-xs">
+                Resolving the real playback URL for {stream.streamer}.
+              </p>
             </div>
           )}
 
-          {/* Video Player Custom Controls Overlay */}
-          <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/20 to-black/40 opacity-0 group-hover:opacity-100 transition-opacity p-4 flex flex-col justify-between z-10">
-            {/* Top Bar inside player */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="bg-[#e11d48] text-white text-[10px] font-extrabold px-2 py-0.5 rounded tracking-wider flex items-center gap-1">
-                  <Radio className="w-3 h-3 animate-pulse" />
-                  LIVE
-                </span>
-                <span className="bg-black/70 backdrop-blur-md text-white text-xs font-bold px-2.5 py-1 rounded flex items-center gap-1.5 border border-white/10">
-                  <Eye className="w-3.5 h-3.5 text-[#53fc18]" />
-                  {formatViewers(viewerCount)}
-                </span>
-              </div>
-
-              <div className="hidden md:block">
-                <button
-                  onClick={onClose}
-                  className="bg-black/70 hover:bg-black/90 text-white p-2 rounded-full border border-white/20 transition-all cursor-pointer"
-                  title="Close stream viewer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
+          {/* Offline state (real channel with no playback URL) */}
+          {!resolving && mediaMode === 'none' && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60 p-6 text-center">
+              <span className="flex items-center gap-2 bg-[#1e2638] text-[#94a3b8] text-[10px] font-extrabold px-3 py-1 rounded tracking-wider uppercase">
+                <Radio className="w-3 h-3" />
+                Offline
+              </span>
+              <p className="text-sm font-bold text-white">This channel is currently offline</p>
+              <p className="text-xs text-[#94a3b8] max-w-xs">
+                Live playback is available when the streamer goes live.
+              </p>
             </div>
+          )}
 
-            {/* Bottom Controls Area inside player */}
-            <div className="space-y-3 w-full bg-black/70 backdrop-blur-md p-3 rounded-xl border border-white/10 shadow-2xl">
-              {/* Seek Bar & DVR Controls Row */}
-              <div className="space-y-2 w-full">
-                {/* Time Info & DVR Jump Bar */}
-                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono font-bold text-[#94a3b8]">
-                  <div className="flex items-center gap-2.5">
-                    {/* Live / DVR Edge Button */}
-                    {currentTime >= duration - 3 ? (
-                      <button
-                        onClick={handleJumpToLive}
-                        className="flex items-center gap-1.5 bg-[#e11d48] text-white px-2.5 py-1 rounded text-[10px] font-extrabold tracking-wider uppercase shadow-[0_0_10px_rgba(225,29,72,0.4)] cursor-pointer"
-                        title="You are at the live stream edge"
+          {/* Animated Stream Visualizer Overlay (playing indicator) */}
+          {isHlsMode && isPlaying && !buffering && !mediaError && (
+            <div className="absolute top-4 right-4 flex items-center gap-1 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 pointer-events-none">
+              <span className="w-1.5 h-4 bg-[#53fc18] animate-[bounce_1s_infinite_100ms]" />
+              <span className="w-1.5 h-6 bg-[#53fc18] animate-[bounce_1s_infinite_300ms]" />
+              <span className="w-1.5 h-3 bg-[#53fc18] animate-[bounce_1s_infinite_200ms]" />
+              <span className="text-xs font-bold text-white ml-1.5">
+                {isLive ? 'LIVE' : 'PLAYING'}
+              </span>
+            </div>
+          )}
+
+          {/* Buffering spinner */}
+          {isHlsMode && buffering && !mediaError && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/40 pointer-events-none z-30">
+              <Loader2 className="w-12 h-12 text-[#53fc18] animate-spin" />
+            </div>
+          )}
+
+          {/* Media error overlay */}
+          {isHlsMode && mediaError && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/80 p-6 text-center z-30">
+              <AlertTriangle className="w-10 h-10 text-[#e11d48]" />
+              <p className="text-sm font-bold text-white">Stream unavailable right now</p>
+              <p className="text-xs text-[#94a3b8] max-w-xs">
+                The stream could not be loaded. The channel may be offline or blocked.
+              </p>
+              <button
+                onClick={() => {
+                  setMediaError(false);
+                  setReloadKey((k) => k + 1);
+                }}
+                className="mt-1 flex items-center gap-2 bg-[#53fc18] hover:bg-[#45d413] text-[#0b0e14] font-extrabold text-sm px-5 py-2 rounded-lg transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-4 h-4" />
+                Retry
+              </button>
+            </div>
+          )}
+
+          {/* Unmute affordance (autoplay policy forces muted start) */}
+          {isHlsMode && isMuted && !mediaError && !buffering && (
+            <button
+              onClick={() => setIsMuted(false)}
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-black/70 backdrop-blur-md hover:bg-[#161c2a] text-white text-xs font-bold px-4 py-2 rounded-full border border-white/20 transition-all cursor-pointer z-20"
+            >
+              <Volume1 className="w-4 h-4 text-[#53fc18]" />
+              Sound off — tap to unmute
+            </button>
+          )}
+
+          {/* Custom Controls Overlay (only when we control the media) */}
+          {isHlsMode && (
+            <div
+              className={`absolute inset-0 bg-gradient-to-t from-black/95 via-black/20 to-black/40 transition-opacity duration-300 p-4 flex flex-col justify-between z-10 ${
+                controlsVisible || !isPlaying || isSeeking ? 'opacity-100' : 'opacity-0'
+              }`}
+              onMouseMove={showControlsTemporarily}
+              onMouseEnter={showControlsTemporarily}
+              onClick={(e) => {
+                const t = e.target as HTMLElement;
+                if (t.closest('button, input, select, label')) return;
+                togglePlay();
+                showControlsTemporarily();
+              }}
+            >
+              {/* Top Bar inside player */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`flex items-center gap-1 text-white text-[10px] font-extrabold px-2 py-0.5 rounded tracking-wider ${
+                      isLive && atLiveEdge ? 'bg-[#e11d48]' : 'bg-[#161c2a] border border-[#232b3e]'
+                    }`}
+                  >
+                    <Radio className="w-3 h-3 animate-pulse" />
+                    {isLive && atLiveEdge ? 'LIVE' : isLive ? 'DVR' : 'PLAYING'}
+                  </span>
+                  <span className="bg-black/70 backdrop-blur-md text-white text-xs font-bold px-2.5 py-1 rounded flex items-center gap-1.5 border border-white/10">
+                    <Eye className="w-3.5 h-3.5 text-[#53fc18]" />
+                    {formatViewers(viewerCount)}
+                  </span>
+                </div>
+
+                <div className="hidden md:block">
+                  <button
+                    onClick={onClose}
+                    className="bg-black/70 hover:bg-black/90 text-white p-2 rounded-full border border-white/20 transition-all cursor-pointer"
+                    title="Close stream viewer"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Bottom Controls Area inside player */}
+              <div className="space-y-3 w-full bg-black/70 backdrop-blur-md p-3 rounded-xl border border-white/10 shadow-2xl">
+                {/* Seek Bar & DVR Controls Row */}
+                <div className="space-y-2 w-full">
+                  {/* Time Info & DVR Jump Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono font-bold text-[#94a3b8]">
+                    <div className="flex items-center gap-2.5">
+                      {/* Live / DVR Edge Button */}
+                      {isLive ? (
+                        <button
+                          onClick={jumpToLive}
+                          className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] font-extrabold tracking-wider uppercase transition-all cursor-pointer ${
+                            atLiveEdge
+                              ? 'bg-[#e11d48] text-white shadow-[0_0_10px_rgba(225,29,72,0.4)]'
+                              : 'bg-[#161c2a] hover:bg-[#1e2638] text-[#53fc18] border border-[#53fc18]/40 shadow-[0_0_8px_rgba(83,252,24,0.2)]'
+                          }`}
+                          title={
+                            atLiveEdge ? 'You are at the live edge' : 'Click to jump to the live edge'
+                          }
+                        >
+                          {atLiveEdge ? (
+                            <>
+                              <Radio className="w-3 h-3 animate-pulse" />
+                              LIVE
+                            </>
+                          ) : (
+                            <>
+                              <SkipForward className="w-3 h-3" />
+                              <span>DVR (-{formatTime(Math.max(0, secondsFromLive))}) · JUMP TO LIVE</span>
+                            </>
+                          )}
+                        </button>
+                      ) : (
+                        <span className="flex items-center gap-1.5 bg-[#161c2a] text-[#94a3b8] px-2.5 py-1 rounded text-[10px] font-extrabold uppercase tracking-wider">
+                          <Play className="w-3 h-3" />
+                          {stream.category}
+                        </span>
+                      )}
+
+                      <span className="text-white text-xs">
+                        {formatTime(clampedTime)}{' '}
+                        <span className="text-[#64748b]">/</span>{' '}
+                        {formatTime(isLive ? seekRange.end : seekRange.end)}
+                      </span>
+                    </div>
+
+                    {/* DVR Stream Buffer Selector & Quick Seek Shortcut Buttons */}
+                    <div className="flex items-center gap-2">
+                      {isLive && (
+                        <div className="flex items-center gap-1 bg-black/80 px-2 py-0.5 rounded border border-white/10 text-[10px]">
+                          <span className="text-[#64748b] font-sans">DVR Window:</span>
+                          {(['10m', '30m', '1h', '3h', '6h'] as const).map((opt) => (
+                            <button
+                              key={opt}
+                              onClick={() => setDvrWindowOption(opt)}
+                              className={`px-1.5 py-0.5 rounded font-extrabold transition-all cursor-pointer ${
+                                dvrWindowOption === opt
+                                  ? 'bg-[#53fc18] text-[#0b0e14]'
+                                  : 'text-[#94a3b8] hover:text-white'
+                              }`}
+                            >
+                              {opt}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => seekRelative(-30)}
+                          className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 text-[10px] transition-colors cursor-pointer"
+                          title="Rewind 30 seconds"
+                        >
+                          -30s
+                        </button>
+                        <button
+                          onClick={() => seekRelative(-10)}
+                          className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 flex items-center gap-0.5 text-[10px] transition-colors cursor-pointer"
+                          title="Rewind 10 seconds"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>-10s</span>
+                        </button>
+                        <button
+                          onClick={() => seekRelative(10)}
+                          className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 flex items-center gap-0.5 text-[10px] transition-colors cursor-pointer"
+                          title="Forward 10 seconds"
+                        >
+                          <RotateCw className="w-3 h-3" />
+                          <span>+10s</span>
+                        </button>
+                        <button
+                          onClick={() => seekRelative(30)}
+                          className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 text-[10px] transition-colors cursor-pointer"
+                          title="Forward 30 seconds"
+                        >
+                          +30s
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Seek Bar Slider Track with Hover Tooltip */}
+                  <div
+                    ref={seekBarRef}
+                    onMouseMove={(e) => {
+                      if (!seekBarRef.current) return;
+                      const rect = seekBarRef.current.getBoundingClientRect();
+                      const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                      setHoverTime(displayStart + pos * windowLen);
+                      setHoverX(e.clientX - rect.left);
+                    }}
+                    onMouseLeave={() => {
+                      setHoverTime(null);
+                      setHoverX(null);
+                    }}
+                    className="relative group/seek h-4 flex items-center cursor-pointer select-none"
+                  >
+                    {/* Hover Timestamp Tooltip */}
+                    {hoverTime !== null && hoverX !== null && (
+                      <div
+                        className="absolute -top-9 -translate-x-1/2 bg-[#0b0e14]/95 text-[#53fc18] text-[11px] font-mono font-extrabold px-2.5 py-1 rounded border border-[#53fc18]/40 shadow-2xl pointer-events-none z-30"
+                        style={{ left: `${hoverX}px` }}
                       >
-                        <Radio className="w-3 h-3 animate-pulse" />
-                        LIVE
-                      </button>
-                    ) : (
-                      <button
-                        onClick={handleJumpToLive}
-                        className="flex items-center gap-1.5 bg-[#161c2a] hover:bg-[#1e2638] text-[#53fc18] border border-[#53fc18]/40 px-2.5 py-1 rounded text-[10px] font-extrabold tracking-wider uppercase transition-all cursor-pointer shadow-[0_0_8px_rgba(83,252,24,0.2)]"
-                        title="Click to jump to live edge"
-                      >
-                        <SkipForward className="w-3 h-3 text-[#53fc18]" />
-                        <span>DVR (-{formatTime(duration - currentTime)}) · JUMP TO LIVE</span>
-                      </button>
+                        Seek: {formatTime(hoverTime)}
+                      </div>
                     )}
 
-                    <span className="text-white text-xs">
-                      {formatTime(currentTime)}{' '}
-                      <span className="text-[#64748b]">/</span> {formatTime(duration)}
-                    </span>
-                  </div>
-
-                  {/* DVR Stream Buffer Selector & Quick Seek Shortcut Buttons */}
-                  <div className="flex items-center gap-2">
-                    {/* DVR Window Buffer Selector */}
-                    <div className="flex items-center gap-1 bg-black/80 px-2 py-0.5 rounded border border-white/10 text-[10px]">
-                      <span className="text-[#64748b] font-sans">DVR Window:</span>
-                      {(['10m', '30m', '1h', '3h', '6h'] as const).map((opt) => (
-                        <button
-                          key={opt}
-                          onClick={() => handleDvrWindowChange(opt)}
-                          className={`px-1.5 py-0.5 rounded font-extrabold transition-all cursor-pointer ${
-                            dvrWindowOption === opt
-                              ? 'bg-[#53fc18] text-[#0b0e14]'
-                              : 'text-[#94a3b8] hover:text-white'
-                          }`}
-                        >
-                          {opt}
-                        </button>
-                      ))}
-                    </div>
-
-                    {/* Quick Seek Shortcut Buttons (-30s, -10s, +10s, +30s) */}
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => handleSeekRelative(-30)}
-                        className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 text-[10px] transition-colors cursor-pointer"
-                        title="Rewind 30 seconds"
-                      >
-                        -30s
-                      </button>
-                      <button
-                        onClick={() => handleSeekRelative(-10)}
-                        className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 flex items-center gap-0.5 text-[10px] transition-colors cursor-pointer"
-                        title="Rewind 10 seconds"
-                      >
-                        <RotateCcw className="w-3 h-3" />
-                        <span>-10s</span>
-                      </button>
-                      <button
-                        onClick={() => handleSeekRelative(10)}
-                        className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 flex items-center gap-0.5 text-[10px] transition-colors cursor-pointer"
-                        title="Forward 10 seconds"
-                      >
-                        <RotateCw className="w-3 h-3" />
-                        <span>+10s</span>
-                      </button>
-                      <button
-                        onClick={() => handleSeekRelative(30)}
-                        className="px-1.5 py-0.5 rounded bg-black/70 hover:bg-black text-[#e1e7ef] hover:text-[#53fc18] border border-white/10 text-[10px] transition-colors cursor-pointer"
-                        title="Forward 30 seconds"
-                      >
-                        +30s
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Seek Bar Slider Track with Hover Tooltip */}
-                <div
-                  ref={seekBarRef}
-                  onMouseMove={(e) => {
-                    if (!seekBarRef.current) return;
-                    const rect = seekBarRef.current.getBoundingClientRect();
-                    const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                    setHoverTime(pos * duration);
-                    setHoverX(e.clientX - rect.left);
-                  }}
-                  onMouseLeave={() => {
-                    setHoverTime(null);
-                    setHoverX(null);
-                  }}
-                  className="relative group/seek h-4 flex items-center cursor-pointer select-none"
-                >
-                  {/* Hover Timestamp Tooltip */}
-                  {hoverTime !== null && hoverX !== null && (
-                    <div
-                      className="absolute -top-9 -translate-x-1/2 bg-[#0b0e14]/95 text-[#53fc18] text-[11px] font-mono font-extrabold px-2.5 py-1 rounded border border-[#53fc18]/40 shadow-2xl pointer-events-none z-30"
-                      style={{ left: `${hoverX}px` }}
-                    >
-                      Seek: {formatTime(hoverTime)}
-                    </div>
-                  )}
-
-                  {/* Track Background Rail */}
-                  <div className="w-full h-2 bg-[#1e2638] group-hover/seek:h-3 rounded-full overflow-hidden transition-all relative">
-                    {/* Live Progress Fill Bar */}
-                    <div
-                      className="h-full bg-[#53fc18] rounded-full shadow-[0_0_12px_rgba(83,252,24,0.6)] relative transition-[width] duration-75"
-                      style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
-                    />
-                  </div>
-
-                  {/* Scrub Handle Knob */}
-                  <div
-                    className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-4 h-4 bg-white border-2 border-[#53fc18] rounded-full shadow-lg opacity-0 group-hover/seek:opacity-100 transition-opacity pointer-events-none z-20"
-                    style={{ left: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
-                  />
-
-                  {/* Native Range Input for Mouse Drag & Touch Scrubbing */}
-                  <input
-                    type="range"
-                    min="0"
-                    max={duration}
-                    step="0.5"
-                    value={currentTime}
-                    onPointerDown={() => {
-                      setIsSeeking(true);
-                      if (playerMode === 'embed') {
-                        setPlayerMode('direct');
-                      }
-                    }}
-                    onPointerUp={() => setIsSeeking(false)}
-                    onTouchStart={() => {
-                      setIsSeeking(true);
-                      if (playerMode === 'embed') {
-                        setPlayerMode('direct');
-                      }
-                    }}
-                    onTouchEnd={() => setIsSeeking(false)}
-                    onMouseDown={() => {
-                      setIsSeeking(true);
-                      if (playerMode === 'embed') {
-                        setPlayerMode('direct');
-                      }
-                    }}
-                    onMouseUp={() => setIsSeeking(false)}
-                    onChange={(e) => handleSeekChange(parseFloat(e.target.value))}
-                    onInput={(e) => handleSeekChange(parseFloat((e.target as HTMLInputElement).value))}
-                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
-                  />
-                </div>
-              </div>
-
-              {/* Action Buttons Row */}
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={togglePlay}
-                    className="p-1.5 text-white hover:text-[#53fc18] transition-colors cursor-pointer"
-                  >
-                    {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 fill-current" />}
-                  </button>
-
-                  <div className="flex items-center gap-2 group/vol">
-                    <button
-                      onClick={() => setIsMuted(!isMuted)}
-                      className="p-1.5 text-white hover:text-[#53fc18] transition-colors cursor-pointer"
-                    >
-                      {isMuted || volume === 0 ? (
-                        <VolumeX className="w-5 h-5" />
-                      ) : (
-                        <Volume2 className="w-5 h-5" />
+                    {/* Track Background Rail */}
+                    <div className="w-full h-2 bg-[#1e2638] group-hover/seek:h-3 rounded-full overflow-hidden transition-all relative">
+                      {/* Buffered Fill (YouTube-style white) */}
+                      {bufferedPct > progressPct && (
+                        <div
+                          className="absolute left-0 top-0 h-full bg-white/20"
+                          style={{ width: `${Math.max(0, Math.min(100, bufferedPct))}%` }}
+                        />
                       )}
-                    </button>
+                      {/* Played Fill Bar */}
+                      <div
+                        className="h-full bg-[#53fc18] rounded-full shadow-[0_0_12px_rgba(83,252,24,0.6)] relative transition-[width] duration-75"
+                        style={{ width: `${Math.max(0, Math.min(100, progressPct))}%` }}
+                      />
+                      {/* DVR window start marker (live only) */}
+                      {isLive && windowLen > 0 && displayStart > seekRange.start && (
+                        <div
+                          className="absolute top-0 h-full w-0.5 bg-white/50"
+                          style={{ left: `${((displayStart - seekRange.start) / Math.max(1, seekRange.end - seekRange.start)) * 100}%` }}
+                        />
+                      )}
+                    </div>
+
+                    {/* Scrub Handle Knob */}
+                    <div
+                      className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-4 h-4 bg-white border-2 border-[#53fc18] rounded-full shadow-lg opacity-0 group-hover/seek:opacity-100 transition-opacity pointer-events-none z-20"
+                      style={{ left: `${Math.max(0, Math.min(100, progressPct))}%` }}
+                    />
+
+                    {/* Native Range Input for Mouse Drag & Touch Scrubbing */}
                     <input
                       type="range"
-                      min="0"
-                      max="100"
-                      value={isMuted ? 0 : volume}
-                      onChange={(e) => {
-                        setVolume(Number(e.target.value));
-                        setIsMuted(false);
+                      min={displayStart}
+                      max={Math.max(displayStart + 0.01, displayEnd)}
+                      step="0.5"
+                      value={clampedTime}
+                      onPointerDown={() => {
+                        isSeekingRef.current = true;
+                        setIsSeeking(true);
                       }}
-                      className="w-16 accent-[#53fc18] cursor-pointer"
+                      onPointerUp={() => {
+                        isSeekingRef.current = false;
+                        setIsSeeking(false);
+                      }}
+                      onTouchStart={() => {
+                        isSeekingRef.current = true;
+                        setIsSeeking(true);
+                      }}
+                      onTouchEnd={() => {
+                        isSeekingRef.current = false;
+                        setIsSeeking(false);
+                      }}
+                      onMouseDown={() => {
+                        isSeekingRef.current = true;
+                        setIsSeeking(true);
+                      }}
+                      onMouseUp={() => {
+                        isSeekingRef.current = false;
+                        setIsSeeking(false);
+                      }}
+                      onChange={(e) => seekTo(parseFloat(e.target.value))}
+                      onInput={(e) => seekTo(parseFloat((e.target as HTMLInputElement).value))}
+                      className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                     />
                   </div>
                 </div>
 
-                <div className="flex items-center gap-3">
-                  <select
-                    value={quality}
-                    onChange={(e) => setQuality(e.target.value)}
-                    className="bg-black/70 text-white text-xs font-bold px-2 py-1 rounded border border-white/20 focus:outline-none"
-                  >
-                    <option value="1080p60">1080p60 (Source)</option>
-                    <option value="720p60">720p60</option>
-                    <option value="480p">480p</option>
-                    <option value="Auto">Auto</option>
-                  </select>
+                {/* Action Buttons Row */}
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={togglePlay}
+                      className="p-1.5 text-white hover:text-[#53fc18] transition-colors cursor-pointer"
+                    >
+                      {isPlaying ? (
+                        <Pause className="w-5 h-5" />
+                      ) : (
+                        <Play className="w-5 h-5 fill-current" />
+                      )}
+                    </button>
 
-                  <button
-                    onClick={() => {
-                      const el = document.documentElement;
-                      if (!document.fullscreenElement) el.requestFullscreen?.();
-                      else document.exitFullscreen?.();
-                    }}
-                    className="p-1.5 text-white hover:text-[#53fc18] transition-colors cursor-pointer"
-                    title="Fullscreen"
-                  >
-                    <Maximize className="w-5 h-5" />
-                  </button>
+                    <div className="flex items-center gap-2 group/vol">
+                      <button
+                        onClick={() => setIsMuted(!isMuted)}
+                        className="p-1.5 text-white hover:text-[#53fc18] transition-colors cursor-pointer"
+                      >
+                        {isMuted || volume === 0 ? (
+                          <VolumeX className="w-5 h-5" />
+                        ) : (
+                          <Volume2 className="w-5 h-5" />
+                        )}
+                      </button>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={isMuted ? 0 : volume}
+                        onChange={(e) => {
+                          setVolume(Number(e.target.value));
+                          setIsMuted(false);
+                        }}
+                        className="w-16 accent-[#53fc18] cursor-pointer"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <select
+                      value={qualityIndex}
+                      onChange={(e) => handleQualityChange(Number(e.target.value))}
+                      disabled={levels.length === 0}
+                      className="bg-black/70 text-white text-xs font-bold px-2 py-1 rounded border border-white/20 focus:outline-none disabled:opacity-50"
+                      title={levels.length === 0 ? 'Quality auto-selected by the player' : 'Quality'}
+                    >
+                      <option value={-1}>Auto</option>
+                      {levels.map((l) => (
+                        <option key={l.index} value={l.index}>
+                          {l.label}
+                        </option>
+                      ))}
+                      {levels.length === 0 && <option value={-1}>1080p60 (Source)</option>}
+                    </select>
+
+                    <button
+                      onClick={() => {
+                        const el = document.documentElement;
+                        if (!document.fullscreenElement) el.requestFullscreen?.();
+                        else document.exitFullscreen?.();
+                      }}
+                      className="p-1.5 text-white hover:text-[#53fc18] transition-colors cursor-pointer"
+                      title="Fullscreen"
+                    >
+                      <Maximize className="w-5 h-5" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
+          )}
         </div>
 
         {/* Stream & Channel Details */}
@@ -641,6 +946,12 @@ export const StreamPlayerModal: React.FC<StreamPlayerModalProps> = ({
                     <Users className="w-3.5 h-3.5 text-[#53fc18]" />
                     {formatViewers(viewerCount)} watching now
                   </span>
+                  {stream.startedAt && (
+                    <>
+                      <span>•</span>
+                      <span>{stream.startedAt}</span>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -710,21 +1021,33 @@ export const StreamPlayerModal: React.FC<StreamPlayerModalProps> = ({
         {/* Chat Messages Feed */}
         <div className="flex-1 overflow-y-auto p-3 space-y-2.5 text-xs font-sans">
           {chatMessages.map((msg) => (
-            <div key={msg.id} className="leading-relaxed break-words hover:bg-[#161c2a]/60 p-1 rounded transition-colors">
+            <div
+              key={msg.id}
+              className="leading-relaxed break-words hover:bg-[#161c2a]/60 p-1 rounded transition-colors"
+            >
               <span className="text-[#64748b] mr-2 text-[10px] font-mono">{msg.timestamp}</span>
 
               {msg.isSubscriber && (
-                <span className="inline-block bg-[#53fc18] text-[#0b0e14] font-black text-[9px] px-1 rounded mr-1" title="Subscriber">
+                <span
+                  className="inline-block bg-[#53fc18] text-[#0b0e14] font-black text-[9px] px-1 rounded mr-1"
+                  title="Subscriber"
+                >
                   SUB
                 </span>
               )}
               {msg.isMod && (
-                <span className="inline-block bg-[#06b6d4] text-black font-black text-[9px] px-1 rounded mr-1" title="Moderator">
+                <span
+                  className="inline-block bg-[#06b6d4] text-black font-black text-[9px] px-1 rounded mr-1"
+                  title="Moderator"
+                >
                   MOD
                 </span>
               )}
               {msg.isVIP && (
-                <span className="inline-block bg-[#f59e0b] text-black font-black text-[9px] px-1 rounded mr-1" title="VIP">
+                <span
+                  className="inline-block bg-[#f59e0b] text-black font-black text-[9px] px-1 rounded mr-1"
+                  title="VIP"
+                >
                   VIP
                 </span>
               )}

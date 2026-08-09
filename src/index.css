@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+@theme {
+  --color-punch-bg: #0b0e14;
+  --color-punch-surface: #161c2a;
+  --color-punch-border: #1e2638;
+  --color-punch-accent: #53fc18;
+  --color-punch-text: #e1e7ef;
+  --color-punch-muted: #94a3b8;
+}
+
+@layer base {
+  html {
+    background-color: #0b0e14;
+    color-scheme: dark;
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+}
+
+@keyframes punch-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes punch-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-in {
+  animation: punch-fade-in 0.2s ease-out both;
+}
+
+.fade-in {
+  animation-name: punch-fade-in;
+}
+
+.animate-slide-in {
+  animation: punch-slide-in 0.3s ease-out both;
+}
+
+/* Slim dark scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0b0e14;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e2638;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #28334b;
+}

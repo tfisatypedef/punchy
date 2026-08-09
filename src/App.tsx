@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Navbar } from './components/Navbar';
 import { Sidebar } from './components/Sidebar';
 import { HomeScreen } from './components/HomeScreen';
@@ -19,41 +19,74 @@ export function App() {
   );
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
 
-  // Parse direct Kick URL if entered into search (e.g. https://kick.com/adrienbroner)
-  const ingestedStreamFromQuery = useMemo(() => {
-    if (!searchQuery.includes('kick.com/') && !searchQuery.startsWith('http')) return null;
-    const cleanHandle = searchQuery
-      .trim()
+  // Direct kick.com URL entered into search resolves to a real stream via the server
+  // (server proxies Kick's v2 channel endpoint and returns a real HLS playback URL).
+  const [ingestedStream, setIngestedStream] = useState<KickStream | null>(null);
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (!query.includes('kick.com/') && !query.startsWith('http')) {
+      setIngestedStream(null);
+      return;
+    }
+
+    const cleanHandle = query
       .replace(/^https?:\/\//i, '')
       .replace(/^kick\.com\//i, '')
       .replace(/^player\.kick\.com\//i, '')
       .split('/')[0]
       .split('?')[0];
+    if (!cleanHandle) {
+      setIngestedStream(null);
+      return;
+    }
 
-    if (!cleanHandle) return null;
-
+    // Instant client-side fallback so the UI responds immediately
     const existing = INITIAL_STREAMS.find(
-      (s) => s.streamer.toLowerCase() === cleanHandle.toLowerCase() || s.id === cleanHandle.toLowerCase()
+      (s) =>
+        s.streamer.toLowerCase() === cleanHandle.toLowerCase() ||
+        s.id === cleanHandle.toLowerCase()
     );
 
-    if (existing) return existing;
+    const fallback: KickStream =
+      existing ??
+      ({
+        id: cleanHandle.toLowerCase(),
+        title: `${cleanHandle} Live Stream Ingest`,
+        streamer: cleanHandle,
+        avatarUrl:
+          'https://images.unsplash.com/photo-1517838277536-f5f99be501cd?auto=format&fit=crop&w=150&q=80',
+        category: 'Just Chatting',
+        viewers: 24500,
+        accent: '#53fc18',
+        isLive: true,
+        thumbnailUrl:
+          'https://images.unsplash.com/photo-1549719386-74dfcbf7dbed?auto=format&fit=crop&w=800&q=80',
+        tags: ['Live Ingest', 'Kick Proxy'],
+        streamUrl: `https://player.kick.com/${cleanHandle}`,
+        bio: `Ingested Kick Stream channel for ${cleanHandle}`,
+        followersCount: 150000,
+        startedAt: 'Just now',
+      } as KickStream);
+    setIngestedStream(fallback);
 
-    return {
-      id: cleanHandle.toLowerCase(),
-      title: `${cleanHandle} Live Stream Ingest`,
-      streamer: cleanHandle,
-      avatarUrl: 'https://images.unsplash.com/photo-1517838277536-f5f99be501cd?auto=format&fit=crop&w=150&q=80',
-      category: 'Just Chatting',
-      viewers: 24500,
-      accent: '#53fc18',
-      isLive: true,
-      thumbnailUrl: 'https://images.unsplash.com/photo-1549719386-74dfcbf7dbed?auto=format&fit=crop&w=800&q=80',
-      tags: ['Live Ingest', 'Kick Proxy'],
-      streamUrl: `https://player.kick.com/${cleanHandle}`,
-      bio: `Ingested Kick Stream channel for ${cleanHandle}`,
-      followersCount: 150000,
-      startedAt: 'Just now',
-    } as KickStream;
+    let cancelled = false;
+    fetch('/api/v1/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: query }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (!cancelled && res?.data) setIngestedStream(res.data);
+      })
+      .catch(() => {
+        /* keep the client-side fallback */
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [searchQuery]);
 
   // Search filter across streams
@@ -122,7 +155,7 @@ export function App() {
               </div>
 
               {/* Direct Kick URL Ingest Banner */}
-              {ingestedStreamFromQuery && (
+              {ingestedStream && (
                 <div className="bg-[#161c2a] border-2 border-[#53fc18] rounded-2xl p-4 md:p-6 flex flex-col md:flex-row items-center justify-between gap-4 shadow-[0_0_24px_rgba(83,252,24,0.25)]">
                   <div className="flex items-center gap-4">
                     <div className="w-12 h-12 rounded-full bg-[#53fc18] flex items-center justify-center text-[#0b0e14] font-black text-xl">
@@ -134,17 +167,17 @@ export function App() {
                           Detected Channel Ingest
                         </span>
                         <h3 className="text-lg font-extrabold text-white">
-                          kick.com/{ingestedStreamFromQuery.streamer}
+                          kick.com/{ingestedStream.streamer}
                         </h3>
                       </div>
                       <p className="text-xs text-[#94a3b8] mt-1">
-                        {ingestedStreamFromQuery.title}
+                        {ingestedStream.title}
                       </p>
                     </div>
                   </div>
 
                   <button
-                    onClick={() => setSelectedStream(ingestedStreamFromQuery)}
+                    onClick={() => setSelectedStream(ingestedStream)}
                     className="w-full md:w-auto flex items-center justify-center gap-2 bg-[#53fc18] hover:bg-[#45d413] text-[#0b0e14] font-extrabold px-6 py-3 rounded-xl shadow-[0_0_16px_rgba(83,252,24,0.4)] transition-all cursor-pointer shrink-0"
                   >
                     <Play className="w-5 h-5 fill-current" />
@@ -163,7 +196,7 @@ export function App() {
                     />
                   ))}
                 </div>
-              ) : !ingestedStreamFromQuery ? (
+              ) : !ingestedStream ? (
                 <p className="text-[#64748b]">No channels or streams matched your search query.</p>
               ) : null}
             </div>
